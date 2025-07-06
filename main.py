@@ -11,7 +11,7 @@ from urllib.parse import unquote, urlparse
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
-from telethon.errors.rpcerrorlist import FloodWaitError, MessageNotModifiedError, WebpageCurlFailedError
+from telethon.errors.rpcerrorlist import FloodWaitError, MessageNotModifiedError
 from telethon.tl.types import DocumentAttributeFilename
 
 # --- Basic Configuration ---
@@ -23,8 +23,6 @@ load_dotenv()
 API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-
-# --- NEW: Load Admin IDs from .env file ---
 try:
     admin_ids_str = os.getenv('ADMIN_IDS', '')
     ADMIN_IDS = {int(admin_id.strip()) for admin_id in admin_ids_str.split(',') if admin_id}
@@ -36,9 +34,9 @@ except ValueError:
 bot = TelegramClient('DlinkX_bot', API_ID, API_HASH)
 
 # --- Constants & State Management ---
-DOWNLOADS_DIR = "downloads"
+DOWNLOADS_DIR = "downloads" # Kept for shutdown cleanup of any potential leftover files
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-DOWNLOAD_JOBS = {}
+DOWNLOAD_JOBS = {} 
 BLACKLIST_FILE = "blacklist.txt"
 BLACKLISTED_USERS = set()
 USER_COOLDOWNS = {}
@@ -46,7 +44,7 @@ COOLDOWN_SECONDS = 10
 MAX_CONCURRENT_DOWNLOADS = 2
 download_queue = asyncio.Queue()
 
-# --- Helper Functions (Unchanged) ---
+# --- Helper Functions (Mostly Unchanged) ---
 def format_bytes(size: int) -> str:
     if size == 0: return "0 B"
     power = 1024; n = 0
@@ -107,7 +105,7 @@ async def unban_handler(event):
     try: user_id = int(event.pattern_match.group(1)); BLACKLISTED_USERS.discard(user_id); update_blacklist_file(); await event.reply(f"✅ User `{user_id}` unbanned.")
     except Exception as e: await event.reply(f"❌ Error: {e}")
 @bot.on(events.NewMessage(pattern='/start'))
-async def start_handler(event): await event.reply("Hello! I am DlinkX, your hybrid file downloader.")
+async def start_handler(event): await event.reply("Hello! I am DlinkX, your smart file streamer.")
 @bot.on(events.NewMessage(pattern=re.compile(r'https?://\S+')))
 async def link_handler(event):
     user_id = event.sender_id
@@ -140,7 +138,7 @@ async def callback_handler(event):
         try: await download_queue.put(job_id); await event.edit(f"✅ **Request accepted!** You are number **{download_queue.qsize()}** in the queue.", buttons=None)
         except Exception as e: await event.edit(f"❌ Error adding to queue: {e}")
 
-# --- Download Worker with Hybrid Strategy ---
+# --- Smart Stream Worker ---
 async def download_worker(name: str):
     while True:
         job_id = await download_queue.get(); logging.info(f"Worker {name} started job {job_id}")
@@ -148,15 +146,12 @@ async def download_worker(name: str):
         if not job_data: logging.warning(f"Invalid job_id: {job_id}"); download_queue.task_done(); continue
         
         status_message = job_data["status_message"]; info = job_data["info"]; cancellation_event = job_data["cancellation_event"]
-        url, file_name, total_size = info['url'], info['file_name'], info['content_size']
-        local_file_path = os.path.join(DOWNLOADS_DIR, f"{status_message.chat_id}_{job_id}_{file_name}")
         
         try:
-            # --- METHOD 1: ATTEMPT DIRECT STREAM ---
-            logging.info(f"Job {job_id}: Attempting direct stream...")
-            await status_message.edit("`Attempting fast stream method...`")
-            
-            def create_progress_callback(title):
+            url, file_name, total_size = info['url'], info['file_name'], info['content_size']
+            await status_message.edit("`Preparing to stream...`")
+
+            def create_progress_callback():
                 last_update, last_transferred = time.time(), 0
                 async def progress_callback(current, total):
                     nonlocal last_update, last_transferred
@@ -166,66 +161,49 @@ async def download_worker(name: str):
                         percentage = current / total * 100 if total > 0 else 0
                         speed = (current - last_transferred) / (current_time - last_update) if current_time > last_update else 0
                         eta = (total - current) / speed if speed > 0 else None
-                        try: await status_message.edit(f"**{title}...**\nProgress: `{format_bytes(current)}` of `{format_bytes(total)}` ({percentage:.1f}%)\nSpeed: `{format_speed(speed)}`\nETA: `{format_time(eta)}`", buttons=[[Button.inline("❌ Cancel", data=f"livecancel_{job_id}")]] )
+                        try: await status_message.edit(f"**Streaming to Telegram...**\nProgress: `{format_bytes(current)}` of `{format_bytes(total)}` ({percentage:.1f}%)\nSpeed: `{format_speed(speed)}`\nETA: `{format_time(eta)}`", buttons=[[Button.inline("❌ Cancel", data=f"livecancel_{job_id}")]] )
                         except (MessageNotModifiedError, FloodWaitError): pass
                         last_update, last_transferred = current_time, current
                 return progress_callback
 
-            attributes = [DocumentAttributeFilename(file_name=file_name)]
-            await bot.send_file(status_message.chat_id, url, caption=f"`{file_name}`", progress_callback=create_progress_callback("Streaming"), attributes=attributes, cancellable=cancellation_event)
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as r:
+                    r.raise_for_status()
+                    
+                    attributes = [DocumentAttributeFilename(file_name=file_name)]
+                    # The core of smart streaming:
+                    # Pass the async iterator `r.content` directly as the file.
+                    await bot.send_file(
+                        status_message.chat_id,
+                        file=r.content,
+                        file_size=total_size,
+                        caption=f"`{file_name}`",
+                        progress_callback=create_progress_callback(),
+                        attributes=attributes,
+                        cancellable=cancellation_event
+                    )
             await status_message.delete()
 
-        except (WebpageCurlFailedError, TypeError, ValueError) as stream_error:
-            # --- METHOD 2: FALLBACK TO DOWNLOAD & UPLOAD ---
-            logging.warning(f"Job {job_id}: Stream failed ({stream_error}). Reverting to download-then-upload.")
-            try:
-                await status_message.edit("`Stream failed. Trying fallback method...`")
-                
-                downloaded_size, last_update_time, last_downloaded_size = 0, time.time(), 0
-                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, headers=headers) as r:
-                        r.raise_for_status()
-                        with open(local_file_path, 'wb') as f:
-                            async for chunk in r.content.iter_chunked(1024 * 1024):
-                                if cancellation_event.is_set(): raise asyncio.CancelledError
-                                f.write(chunk); downloaded_size += len(chunk)
-
-                await status_message.edit("`Upload starting...`")
-                await bot.send_file(status_message.chat_id, local_file_path, caption=f"`{file_name}`", progress_callback=create_progress_callback("Uploading"), attributes=attributes, cancellable=cancellation_event)
-                await status_message.delete()
-            
-            except asyncio.CancelledError:
-                await status_message.edit("🚫 **Operation Canceled.**"); logging.info(f"Job {job_id} cancelled during fallback.")
-            except Exception as fallback_error:
-                logging.error(f"Error on fallback for job {job_id}: {fallback_error}")
-                await status_message.edit(f"❌ **Fallback method also failed:**\n`{fallback_error}`")
-
         except asyncio.CancelledError:
-            await status_message.edit("🚫 **Operation Canceled.**"); logging.info(f"Job {job_id} cancelled during stream.")
+            await status_message.edit("🚫 **Operation Canceled.**"); logging.info(f"Job {job_id} was cancelled successfully.")
         except Exception as e:
             logging.error(f"Error on job {job_id}: {e}"); await status_message.edit(f"❌ **An unexpected error occurred:**\n`{str(e)}`")
         finally:
-            DOWNLOAD_JOBS.pop(job_id, None)
-            if local_file_path and os.path.exists(local_file_path): os.remove(local_file_path)
+            DOWNLOAD_JOBS.pop(job_id, None) 
             logging.info(f"Worker {name} finished job {job_id}")
             download_queue.task_done()
 
 # --- Main Execution ---
 async def shutdown(loop):
-    logging.warning("Shutdown signal received. Cleaning up...")
-    for filename in os.listdir(DOWNLOADS_DIR):
-        try: os.remove(os.path.join(DOWNLOADS_DIR, filename))
-        except Exception: pass
+    logging.warning("Shutdown signal received. Cleaning up..."); [task.cancel() for task in asyncio.all_tasks() if t is not asyncio.current_task()]
     if bot.is_connected(): await bot.disconnect()
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    [task.cancel() for task in tasks]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.gather(*[t for t in asyncio.all_tasks() if t is not asyncio.current_task()], return_exceptions=True)
 async def main():
     load_blacklist()
     worker_tasks = [asyncio.create_task(download_worker(f"Worker-{i+1}")) for i in range(MAX_CONCURRENT_DOWNLOADS)]
     await bot.start(bot_token=BOT_TOKEN)
-    logging.info(f"Bot is running with {MAX_CONCURRENT_DOWNLOADS} download workers...")
+    logging.info(f"Bot is running with {MAX_CONCURRENT_DOWNLOADS} smart stream workers...")
     await asyncio.gather(bot.run_until_disconnected(), *worker_tasks)
 if __name__ == '__main__':
     loop = asyncio.get_event_loop()
