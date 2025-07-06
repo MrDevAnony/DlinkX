@@ -27,8 +27,17 @@ try:
     admin_ids_str = os.getenv('ADMIN_IDS', '')
     ADMIN_IDS = {int(admin_id.strip()) for admin_id in admin_ids_str.split(',') if admin_id}
 except ValueError:
-    logging.error("Invalid ADMIN_IDS in .env file. Please use comma-separated numeric IDs.")
+    logging.error("Invalid ADMIN_IDS in .env file.")
     ADMIN_IDS = set()
+
+# --- NEW: Load Max File Size from .env ---
+try:
+    max_size_mb_str = os.getenv('MAX_FILE_SIZE_MB', '2000') # Default to 2GB
+    MAX_FILE_SIZE_BYTES = int(max_size_mb_str) * 1024 * 1024
+    logging.info(f"Max file size limit set to {max_size_mb_str} MB.")
+except (ValueError, TypeError):
+    logging.error("Invalid MAX_FILE_SIZE_MB in .env. Defaulting to 2000 MB.")
+    MAX_FILE_SIZE_BYTES = 2000 * 1024 * 1024
 
 # --- Initialize the Bot Client ---
 bot = TelegramClient('DlinkX_bot', API_ID, API_HASH)
@@ -44,7 +53,7 @@ COOLDOWN_SECONDS = 10
 MAX_CONCURRENT_DOWNLOADS = 2
 download_queue = asyncio.Queue()
 
-# --- Helper Functions ---
+# --- Helper Functions (Unchanged) ---
 def format_bytes(size: int) -> str:
     if size == 0: return "0 B"
     power = 1024; n = 0
@@ -52,6 +61,7 @@ def format_bytes(size: int) -> str:
     while size >= power and n < len(power_labels) - 1:
         size /= power; n += 1
     return f"{size:.2f} {power_labels[n]}B"
+
 def format_speed(speed: float) -> str: return f"{format_bytes(int(speed))}/s"
 def format_time(seconds: int) -> str:
     if seconds is None or seconds <= 0: return "N/A"
@@ -59,17 +69,20 @@ def format_time(seconds: int) -> str:
     if hours > 0: return f"{hours}h {minutes}m {seconds}s"
     elif minutes > 0: return f"{minutes}m {seconds}s"
     else: return f"{seconds}s"
+
 def load_blacklist():
     try:
         if os.path.exists(BLACKLIST_FILE):
             with open(BLACKLIST_FILE, 'r') as f: BLACKLISTED_USERS.update(int(line.strip()) for line in f)
             logging.info(f"Loaded {len(BLACKLISTED_USERS)} user(s) from blacklist.")
     except Exception as e: logging.error(f"Error loading blacklist file: {e}")
+
 def update_blacklist_file():
     try:
         with open(BLACKLIST_FILE, 'w') as f:
             for user_id in BLACKLISTED_USERS: f.write(f"{user_id}\n")
     except Exception as e: logging.error(f"Error writing to blacklist file: {e}")
+
 async def get_link_info(url: str) -> dict:
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
     try:
@@ -105,6 +118,7 @@ async def unban_handler(event):
     except Exception as e: await event.reply(f"❌ Error: {e}")
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event): await event.reply("Hello! I am DlinkX, your reliable file downloader.")
+
 @bot.on(events.NewMessage(pattern=re.compile(r'https?://\S+')))
 async def link_handler(event):
     user_id = event.sender_id
@@ -113,16 +127,32 @@ async def link_handler(event):
     if current_time - USER_COOLDOWNS.get(user_id, 0) < COOLDOWN_SECONDS:
         await event.reply(f"Please wait `{COOLDOWN_SECONDS}` seconds."); return
     USER_COOLDOWNS[user_id] = current_time
+
     url = event.text.strip()
     status_message = await event.reply("🔎 `Fetching link details...`")
     info = await get_link_info(url)
-    if not info.get("success"): await status_message.edit(f"❌ **Error:**\n`{info.get('error')}`"); return
+    if not info.get("success"):
+        await status_message.edit(f"❌ **Error:**\n`{info.get('error')}`"); return
+
+    # --- NEW: File Size Limit Check ---
+    file_size = info.get('content_size', 0)
+    if file_size > MAX_FILE_SIZE_BYTES:
+        error_message = (
+            f"❌ **File Too Large**\n\n"
+            f"The file size (`{format_bytes(file_size)}`) "
+            f"exceeds the bot's limit of `{format_bytes(MAX_FILE_SIZE_BYTES)}`."
+        )
+        await status_message.edit(error_message)
+        logging.warning(f"Rejected link from user {user_id} due to file size.")
+        return
+
     job_id = uuid.uuid4().hex[:16]
     DOWNLOAD_JOBS[job_id] = {"info": info, "cancellation_event": asyncio.Event(), "status_message": status_message}
     logging.info(f"Created job {job_id}")
     buttons = [[Button.inline("✅ Proceed", data=f"dl_{job_id}"), Button.inline("❌ Cancel", data=f"cancel_{job_id}")]]
-    response_text = (f"**File Details:**\n\n**File Name:** `{info['file_name']}`\n**Size:** `{format_bytes(info['content_size'])}`")
+    response_text = (f"**File Details:**\n\n**File Name:** `{info['file_name']}`\n**Size:** `{format_bytes(file_size)}`")
     await status_message.edit(response_text, buttons=buttons)
+
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
     data_parts = event.data.decode('utf-8').split('_', 1); action = data_parts[0]; job_id = data_parts[1]
@@ -137,7 +167,7 @@ async def callback_handler(event):
         try: await download_queue.put(job_id); await event.edit(f"✅ **Request accepted!** You are number **{download_queue.qsize()}** in the queue.", buttons=None)
         except Exception as e: await event.edit(f"❌ Error adding to queue: {e}")
 
-# --- Download & Upload Worker ---
+# --- Download & Upload Worker (Unchanged) ---
 async def download_worker(name: str):
     while True:
         job_id = await download_queue.get(); logging.info(f"Worker {name} started job {job_id}")
@@ -150,6 +180,7 @@ async def download_worker(name: str):
         try:
             url, file_name, total_size = info['url'], info['file_name'], info['content_size']
             local_file_path = os.path.join(DOWNLOADS_DIR, f"{status_message.chat_id}_{job_id}_{file_name}")
+
             downloaded_size, last_update_time, last_downloaded_size = 0, time.time(), 0
             cancel_button = [[Button.inline("❌ Cancel Operation", data=f"livecancel_{job_id}")]]
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
@@ -199,7 +230,7 @@ async def download_worker(name: str):
             logging.info(f"Worker {name} finished job {job_id}")
             download_queue.task_done()
 
-# --- Main Execution ---
+# --- Main Execution (Unchanged) ---
 async def shutdown(loop):
     logging.warning("Shutdown signal received. Cleaning up...")
     for filename in os.listdir(DOWNLOADS_DIR):
