@@ -27,15 +27,13 @@ try:
     admin_ids_str = os.getenv('ADMIN_IDS', '')
     ADMIN_IDS = {int(admin_id.strip()) for admin_id in admin_ids_str.split(',') if admin_id}
 except ValueError:
-    logging.error("Invalid ADMIN_IDS in .env file. Please use comma-separated numeric IDs.")
+    logging.error("Invalid ADMIN_IDS in .env file.")
     ADMIN_IDS = set()
 
 # --- Initialize the Bot Client ---
 bot = TelegramClient('DlinkX_bot', API_ID, API_HASH)
 
 # --- Constants & State Management ---
-DOWNLOADS_DIR = "downloads"
-os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 DOWNLOAD_JOBS = {} 
 BLACKLIST_FILE = "blacklist.txt"
 BLACKLISTED_USERS = set()
@@ -83,7 +81,6 @@ async def get_link_info(url: str) -> dict:
                 else:
                     path = urlparse(str(r.url)).path; file_name = unquote(os.path.basename(path)) if path else "download"
                 file_name = re.sub(r'[\\/*?:"<>|]', "", file_name)
-                # We still get the content_size, but we won't use it for the upload promise
                 return {"success": True, "url": str(r.url), "file_name": file_name, "content_size": int(r.headers.get('Content-Length', 0))}
     except Exception as e:
         logging.error(f"AIOHTTP failed to fetch info for {url}: {e}"); return {"success": False, "error": str(e)}
@@ -145,13 +142,10 @@ async def download_worker(name: str):
         job_id = await download_queue.get(); logging.info(f"Worker {name} started job {job_id}")
         job_data = DOWNLOAD_JOBS.get(job_id)
         if not job_data: logging.warning(f"Invalid job_id: {job_id}"); download_queue.task_done(); continue
-        
         status_message = job_data["status_message"]; info = job_data["info"]; cancellation_event = job_data["cancellation_event"]
-        
         try:
             url, file_name, total_size = info['url'], info['file_name'], info['content_size']
             await status_message.edit("`Preparing to stream...`")
-
             def create_progress_callback():
                 last_update, last_transferred = time.time(), 0
                 async def progress_callback(current, total):
@@ -159,24 +153,10 @@ async def download_worker(name: str):
                     if cancellation_event.is_set(): raise asyncio.CancelledError
                     current_time = time.time()
                     if current_time - last_update > 5:
+                        percentage = current / total * 100 if total > 0 else 0
                         speed = (current - last_transferred) / (current_time - last_update) if current_time > last_update else 0
-                        # --- MODIFICATION: Handle unknown total size ---
-                        if total:
-                            percentage = current / total * 100
-                            eta = (total - current) / speed if speed > 0 else None
-                            progress_str = f"`{format_bytes(current)}` of `{format_bytes(total)}` ({percentage:.1f}%)"
-                        else: # When total size is not known
-                            progress_str = f"`{format_bytes(current)}` transferred"
-                            eta = None
-                        
-                        try:
-                            await status_message.edit(
-                                f"**Streaming to Telegram...**\n"
-                                f"Progress: {progress_str}\n"
-                                f"Speed: `{format_speed(speed)}`\n"
-                                f"ETA: `{format_time(eta)}`",
-                                buttons=[[Button.inline("❌ Cancel", data=f"livecancel_{job_id}")]]
-                            )
+                        eta = (total - current) / speed if speed > 0 else None
+                        try: await status_message.edit(f"**Streaming...**\n`{format_bytes(current)}` of `{format_bytes(total)}` ({percentage:.1f}%)\n`{format_speed(speed)}` | ETA: `{format_time(eta)}`", buttons=[[Button.inline("❌ Cancel", data=f"livecancel_{job_id}")]] )
                         except (MessageNotModifiedError, FloodWaitError): pass
                         last_update, last_transferred = current_time, current
                 return progress_callback
@@ -185,28 +165,19 @@ async def download_worker(name: str):
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers=headers) as r:
                     r.raise_for_status()
-                    
                     attributes = [DocumentAttributeFilename(file_name=file_name)]
-                    # --- FIX: Remove the `file_size` argument ---
-                    # Let Telethon figure out the size as it uploads.
                     await bot.send_file(
-                        status_message.chat_id,
-                        file=r.content,
-                        caption=f"`{file_name}`",
-                        progress_callback=create_progress_callback(),
-                        attributes=attributes,
-                        cancellable=cancellation_event
+                        status_message.chat_id, file=r.content, file_size=total_size if total_size > 0 else None,
+                        caption=f"`{file_name}`", progress_callback=create_progress_callback(),
+                        attributes=attributes, cancellable=cancellation_event
                     )
             await status_message.delete()
-
         except asyncio.CancelledError:
-            await status_message.edit("🚫 **Operation Canceled.**"); logging.info(f"Job {job_id} was cancelled successfully.")
+            await status_message.edit("🚫 **Operation Canceled.**"); logging.info(f"Job {job_id} cancelled successfully.")
         except Exception as e:
             logging.error(f"Error on job {job_id}: {e}"); await status_message.edit(f"❌ **An unexpected error occurred:**\n`{str(e)}`")
         finally:
-            DOWNLOAD_JOBS.pop(job_id, None) 
-            logging.info(f"Worker {name} finished job {job_id}")
-            download_queue.task_done()
+            DOWNLOAD_JOBS.pop(job_id, None); logging.info(f"Worker {name} finished job {job_id}"); download_queue.task_done()
 
 # --- Main Execution ---
 async def shutdown(loop):
@@ -217,7 +188,7 @@ async def main():
     load_blacklist()
     worker_tasks = [asyncio.create_task(download_worker(f"Worker-{i+1}")) for i in range(MAX_CONCURRENT_DOWNLOADS)]
     await bot.start(bot_token=BOT_TOKEN)
-    logging.info(f"Bot is running with {MAX_CONCURRENT_DOWNLOADS} smart stream workers...")
+    logging.info(f"Bot is running in SMART STREAM mode with {MAX_CONCURRENT_DOWNLOADS} workers...")
     await asyncio.gather(bot.run_until_disconnected(), *worker_tasks)
 if __name__ == '__main__':
     loop = asyncio.get_event_loop()
@@ -225,12 +196,9 @@ if __name__ == '__main__':
     def signal_handler():
         if main_task: main_task.cancel()
     for sig in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(sig, signal_handler)
-    try:
-        main_task = loop.create_task(main())
-        loop.run_until_complete(main_task)
+    try: main_task = loop.create_task(main()); loop.run_until_complete(main_task)
     except asyncio.CancelledError: logging.info("Main task cancelled.")
     finally:
-        cleanup_task = loop.create_task(shutdown(loop))
-        loop.run_until_complete(cleanup_task)
+        cleanup_task = loop.create_task(shutdown(loop)); loop.run_until_complete(cleanup_task)
         loop.close()
         logging.info("Event loop closed. Exiting.")
