@@ -34,7 +34,7 @@ except ValueError:
 bot = TelegramClient('DlinkX_bot', API_ID, API_HASH)
 
 # --- Constants & State Management ---
-DOWNLOADS_DIR = "downloads" # Kept for shutdown cleanup of any potential leftover files
+DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 DOWNLOAD_JOBS = {} 
 BLACKLIST_FILE = "blacklist.txt"
@@ -44,7 +44,7 @@ COOLDOWN_SECONDS = 10
 MAX_CONCURRENT_DOWNLOADS = 2
 download_queue = asyncio.Queue()
 
-# --- Helper Functions (Mostly Unchanged) ---
+# --- Helper Functions ---
 def format_bytes(size: int) -> str:
     if size == 0: return "0 B"
     power = 1024; n = 0
@@ -83,11 +83,12 @@ async def get_link_info(url: str) -> dict:
                 else:
                     path = urlparse(str(r.url)).path; file_name = unquote(os.path.basename(path)) if path else "download"
                 file_name = re.sub(r'[\\/*?:"<>|]', "", file_name)
+                # We still get the content_size, but we won't use it for the upload promise
                 return {"success": True, "url": str(r.url), "file_name": file_name, "content_size": int(r.headers.get('Content-Length', 0))}
     except Exception as e:
         logging.error(f"AIOHTTP failed to fetch info for {url}: {e}"); return {"success": False, "error": str(e)}
 
-# --- Event Handlers (Admin, Start, Link, Callback) ---
+# --- Event Handlers ---
 @bot.on(events.NewMessage(pattern='/status'))
 async def status_handler(event):
     if event.sender_id not in ADMIN_IDS: return
@@ -158,10 +159,24 @@ async def download_worker(name: str):
                     if cancellation_event.is_set(): raise asyncio.CancelledError
                     current_time = time.time()
                     if current_time - last_update > 5:
-                        percentage = current / total * 100 if total > 0 else 0
                         speed = (current - last_transferred) / (current_time - last_update) if current_time > last_update else 0
-                        eta = (total - current) / speed if speed > 0 else None
-                        try: await status_message.edit(f"**Streaming to Telegram...**\nProgress: `{format_bytes(current)}` of `{format_bytes(total)}` ({percentage:.1f}%)\nSpeed: `{format_speed(speed)}`\nETA: `{format_time(eta)}`", buttons=[[Button.inline("❌ Cancel", data=f"livecancel_{job_id}")]] )
+                        # --- MODIFICATION: Handle unknown total size ---
+                        if total:
+                            percentage = current / total * 100
+                            eta = (total - current) / speed if speed > 0 else None
+                            progress_str = f"`{format_bytes(current)}` of `{format_bytes(total)}` ({percentage:.1f}%)"
+                        else: # When total size is not known
+                            progress_str = f"`{format_bytes(current)}` transferred"
+                            eta = None
+                        
+                        try:
+                            await status_message.edit(
+                                f"**Streaming to Telegram...**\n"
+                                f"Progress: {progress_str}\n"
+                                f"Speed: `{format_speed(speed)}`\n"
+                                f"ETA: `{format_time(eta)}`",
+                                buttons=[[Button.inline("❌ Cancel", data=f"livecancel_{job_id}")]]
+                            )
                         except (MessageNotModifiedError, FloodWaitError): pass
                         last_update, last_transferred = current_time, current
                 return progress_callback
@@ -172,12 +187,11 @@ async def download_worker(name: str):
                     r.raise_for_status()
                     
                     attributes = [DocumentAttributeFilename(file_name=file_name)]
-                    # The core of smart streaming:
-                    # Pass the async iterator `r.content` directly as the file.
+                    # --- FIX: Remove the `file_size` argument ---
+                    # Let Telethon figure out the size as it uploads.
                     await bot.send_file(
                         status_message.chat_id,
                         file=r.content,
-                        file_size=total_size,
                         caption=f"`{file_name}`",
                         progress_callback=create_progress_callback(),
                         attributes=attributes,
