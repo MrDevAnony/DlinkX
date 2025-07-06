@@ -6,7 +6,7 @@ import aiohttp
 import uuid
 import time
 import signal
-import psutil # For system status
+import psutil
 from urllib.parse import unquote, urlparse
 
 from dotenv import load_dotenv
@@ -31,23 +31,25 @@ bot = TelegramClient('DlinkX_bot', API_ID, API_HASH)
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 DOWNLOAD_JOBS = {} 
-
-# --- NEW: Queue, Risk & Admin Management ---
-ADMIN_IDS = {123456789, 987654321}  # <-- IMPORTANT: Replace with your numeric User ID(s)
+ADMIN_IDS = {123456789}  # <-- IMPORTANT: Replace with your numeric User ID
 BLACKLIST_FILE = "blacklist.txt"
 BLACKLISTED_USERS = set()
 USER_COOLDOWNS = {}
 COOLDOWN_SECONDS = 10
-MAX_CONCURRENT_DOWNLOADS = 2 # Number of parallel downloads
+MAX_CONCURRENT_DOWNLOADS = 2
 download_queue = asyncio.Queue()
-
 
 # --- Helper Functions ---
 def format_bytes(size: int) -> str:
-    if size == 0: return "0 B"; power = 1024; n = 0
+    """Correctly formats bytes with proper indentation."""
+    if size == 0:
+        return "0 B"
+    power = 1024
+    n = 0
     power_labels = {0: '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
     while size >= power and n < len(power_labels) - 1:
-        size /= power; n += 1
+        size /= power
+        n += 1
     return f"{size:.2f} {power_labels[n]}B"
 
 def format_speed(speed: float) -> str:
@@ -59,9 +61,8 @@ def format_time(seconds: int) -> str:
     if hours > 0: return f"{hours}h {minutes}m {seconds}s"
     elif minutes > 0: return f"{minutes}m {seconds}s"
     else: return f"{seconds}s"
-    
+
 def load_blacklist():
-    """Loads blacklisted user IDs from the file into memory."""
     try:
         if os.path.exists(BLACKLIST_FILE):
             with open(BLACKLIST_FILE, 'r') as f:
@@ -71,7 +72,6 @@ def load_blacklist():
         logging.error(f"Error loading blacklist file: {e}")
 
 def update_blacklist_file():
-    """Saves the current blacklist set to the file."""
     try:
         with open(BLACKLIST_FILE, 'w') as f:
             for user_id in BLACKLISTED_USERS:
@@ -99,19 +99,13 @@ async def get_link_info(url: str) -> dict:
 @bot.on(events.NewMessage(pattern='/status'))
 async def status_handler(event):
     if event.sender_id not in ADMIN_IDS: return
-    
-    cpu_usage = psutil.cpu_percent()
-    ram_usage = psutil.virtual_memory().percent
-    active_jobs = len(DOWNLOAD_JOBS)
-    queued_jobs = download_queue.qsize()
-
-    status_text = (
-        f"**DlinkX Bot Status**\n\n"
-        f"⚙️ **CPU Usage:** `{cpu_usage}%`\n"
-        f"🧠 **RAM Usage:** `{ram_usage}%`\n"
-        f"🔄 **Active Downloads:** `{active_jobs}`\n"
-        f"⏳ **Queued Jobs:** `{queued_jobs}`"
-    )
+    cpu_usage = psutil.cpu_percent(); ram_usage = psutil.virtual_memory().percent
+    active_jobs = len(DOWNLOAD_JOBS); queued_jobs = download_queue.qsize()
+    status_text = (f"**DlinkX Bot Status**\n\n"
+                   f"⚙️ **CPU Usage:** `{cpu_usage}%`\n"
+                   f"🧠 **RAM Usage:** `{ram_usage}%`\n"
+                   f"🔄 **Active Downloads:** `{active_jobs}`\n"
+                   f"⏳ **Queued Jobs:** `{queued_jobs}`")
     await event.reply(status_text)
 
 @bot.on(events.NewMessage(pattern=r'/ban (\d+)'))
@@ -119,8 +113,7 @@ async def ban_handler(event):
     if event.sender_id not in ADMIN_IDS: return
     try:
         user_id_to_ban = int(event.pattern_match.group(1))
-        BLACKLISTED_USERS.add(user_id_to_ban)
-        update_blacklist_file()
+        BLACKLISTED_USERS.add(user_id_to_ban); update_blacklist_file()
         await event.reply(f"✅ User `{user_id_to_ban}` has been banned.")
     except Exception as e:
         await event.reply(f"❌ Error banning user: {e}")
@@ -130,8 +123,7 @@ async def unban_handler(event):
     if event.sender_id not in ADMIN_IDS: return
     try:
         user_id_to_unban = int(event.pattern_match.group(1))
-        BLACKLISTED_USERS.discard(user_id_to_unban)
-        update_blacklist_file()
+        BLACKLISTED_USERS.discard(user_id_to_unban); update_blacklist_file()
         await event.reply(f"✅ User `{user_id_to_unban}` has been unbanned.")
     except Exception as e:
         await event.reply(f"❌ Error unbanning user: {e}")
@@ -144,18 +136,12 @@ async def start_handler(event):
 @bot.on(events.NewMessage(pattern=re.compile(r'https?://\S+')))
 async def link_handler(event):
     user_id = event.sender_id
-
-    # --- Risk Reduction: Blacklist Check ---
     if user_id in BLACKLISTED_USERS:
-        logging.warning(f"Ignoring request from blacklisted user {user_id}")
-        return
-
-    # --- Risk Reduction: Cooldown Check ---
+        logging.warning(f"Ignoring request from blacklisted user {user_id}"); return
     current_time = time.time()
     last_req_time = USER_COOLDOWNS.get(user_id, 0)
     if current_time - last_req_time < COOLDOWN_SECONDS:
-        await event.reply(f"Please wait `{COOLDOWN_SECONDS}` seconds before sending a new link.")
-        return
+        await event.reply(f"Please wait `{COOLDOWN_SECONDS}` seconds before sending a new link."); return
     USER_COOLDOWNS[user_id] = current_time
 
     url = event.text.strip()
@@ -175,8 +161,7 @@ async def link_handler(event):
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
     data_parts = event.data.decode('utf-8').split('_', 1)
-    action = data_parts[0]
-    job_id = data_parts[1]
+    action = data_parts[0]; job_id = data_parts[1]
     
     if action == "livecancel":
         job = DOWNLOAD_JOBS.get(job_id)
@@ -194,26 +179,20 @@ async def callback_handler(event):
 
     if action == "dl":
         try:
-            # --- Queue Logic ---
-            await download_queue.put(job_id)
-            position = download_queue.qsize()
+            await download_queue.put(job_id); position = download_queue.qsize()
             await event.edit(f"✅ **Request accepted!** You are number **{position}** in the queue.", buttons=None)
         except Exception as e:
             await event.edit(f"❌ Error adding to queue: {e}")
 
 async def download_worker(name: str):
-    """A worker that processes download jobs from the queue."""
     while True:
         job_id = await download_queue.get()
         logging.info(f"Worker {name} started processing job {job_id}")
-        
         job_data = DOWNLOAD_JOBS.get(job_id)
         if not job_data:
             logging.warning(f"Worker {name} found an invalid job_id: {job_id}"); download_queue.task_done(); continue
         
-        status_message = job_data["status_message"]
-        info = job_data["info"]
-        cancellation_event = job_data["cancellation_event"]
+        status_message = job_data["status_message"]; info = job_data["info"]; cancellation_event = job_data["cancellation_event"]
         local_file_path = None
         
         try:
@@ -222,8 +201,8 @@ async def download_worker(name: str):
 
             downloaded_size, last_update_time, last_downloaded_size = 0, time.time(), 0
             cancel_button = [[Button.inline("❌ Cancel Operation", data=f"livecancel_{job_id}")]]
-            
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers=headers) as r:
                     r.raise_for_status()
@@ -258,7 +237,6 @@ async def download_worker(name: str):
             attributes = [DocumentAttributeFilename(file_name=file_name)]
             await bot.send_file(status_message.chat_id, local_file_path, caption=f"`{file_name}`", progress_callback=create_upload_callback(), attributes=attributes, cancellable=cancellation_event)
             await status_message.delete()
-
         except asyncio.CancelledError:
             await status_message.edit("🚫 **Operation Canceled.**"); logging.info(f"Job {job_id} was cancelled successfully.")
         except Exception as e:
@@ -277,25 +255,43 @@ async def shutdown(loop):
         file_path = os.path.join(DOWNLOADS_DIR, filename)
         try: os.remove(file_path)
         except Exception: pass
-    if bot.is_connected(): await bot.disconnect(); logging.info("Bot disconnected.")
+    if bot.is_connected():
+        await bot.disconnect()
+        logging.info("Bot disconnected.")
     tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]; [task.cancel() for task in tasks]
-    await asyncio.gather(*tasks, return_exceptions=True); loop.stop()
+    await asyncio.gather(*tasks, return_exceptions=True);
+    # loop.stop() is not needed when tasks are cancelled, they will raise CancelledError
 
 async def main():
     load_blacklist()
-    # Create and start worker tasks
-    worker_tasks = []
-    for i in range(MAX_CONCURRENT_DOWNLOADS):
-        task = asyncio.create_task(download_worker(f"Worker-{i+1}"))
-        worker_tasks.append(task)
+    worker_tasks = [asyncio.create_task(download_worker(f"Worker-{i+1}")) for i in range(MAX_CONCURRENT_DOWNLOADS)]
     
     await bot.start(bot_token=BOT_TOKEN)
     logging.info(f"Bot is running with {MAX_CONCURRENT_DOWNLOADS} download workers...")
-    await bot.run_until_disconnected()
+    
+    # Keep main task alive
+    await asyncio.gather(*worker_tasks, return_exceptions=True)
 
 if __name__ == '__main__':
     loop = asyncio.get_event_loop()
+    main_task = None
+    
+    def signal_handler():
+        logging.info("Signal received, initiating shutdown.")
+        if main_task:
+            main_task.cancel()
+
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown(loop)))
-    try: loop.run_until_complete(main())
-    finally: loop.close(); logging.info("Event loop closed. Exiting.")
+        loop.add_signal_handler(sig, signal_handler)
+    
+    try:
+        main_task = loop.create_task(main())
+        loop.run_until_complete(main_task)
+    except asyncio.CancelledError:
+        logging.info("Main task cancelled.")
+    finally:
+        # Final cleanup before closing loop
+        cleanup_task = loop.create_task(shutdown(loop))
+        loop.run_until_complete(cleanup_task)
+        loop.close()
+        logging.info("Event loop closed. Exiting.")
