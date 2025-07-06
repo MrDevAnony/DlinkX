@@ -31,7 +31,7 @@ DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 DOWNLOAD_JOBS = {} 
 
-# --- Helper Functions (Unchanged) ---
+# --- Helper Functions ---
 def format_bytes(size: int) -> str:
     if size == 0: return "0 B"
     power = 1024; n = 0
@@ -44,9 +44,25 @@ def format_speed(speed_bytes_per_sec: float) -> str:
     if speed_bytes_per_sec == 0: return "0 B/s"
     return f"{format_bytes(int(speed_bytes_per_sec))}/s"
 
+# --- NEW: Helper function to format time ---
+def format_time(seconds: int) -> str:
+    """Formats seconds into a human-readable string like 1m 25s."""
+    if seconds is None or seconds <= 0:
+        return "N/A"
+    seconds = int(seconds)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    elif minutes > 0:
+        return f"{minutes}m {seconds}s"
+    else:
+        return f"{seconds}s"
+
 async def get_link_info(url: str) -> dict:
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=headers) as session:
             async with session.head(url, allow_redirects=True, timeout=10) as r:
                 r.raise_for_status()
                 file_name = "Unknown"
@@ -70,7 +86,7 @@ async def get_link_info(url: str) -> dict:
 # --- Event Handlers ---
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
-    await event.reply("Hello! I am DlinkX. Send me a direct download link.")
+    await event.reply("Hello! I am DlinkX, your reliable file downloader.")
 
 @bot.on(events.NewMessage(pattern=re.compile(r'https?://\S+')))
 async def link_handler(event):
@@ -99,7 +115,6 @@ async def callback_handler(event):
     action = data_parts[0]
     job_id = data_parts[1]
     
-    # --- Live Cancel Handling ---
     if action == "livecancel":
         job = DOWNLOAD_JOBS.get(job_id)
         if job:
@@ -110,14 +125,13 @@ async def callback_handler(event):
             await event.answer("This job is already completed or invalid.", alert=True)
         return
 
-    # --- **FIX**: Use .get() instead of .pop() to keep the job state alive ---
     job_data = DOWNLOAD_JOBS.get(job_id)
     if not job_data:
         await event.answer("This job has expired or is invalid.", alert=True)
         return
 
     if action == "cancel":
-        DOWNLOAD_JOBS.pop(job_id, None) # Clean up the job
+        DOWNLOAD_JOBS.pop(job_id, None)
         await event.edit("**Download canceled by user.** 🤷‍♂️")
         logging.info(f"Canceled job {job_id}.")
         return
@@ -134,8 +148,9 @@ async def callback_handler(event):
             downloaded_size, last_update_time, last_downloaded_size = 0, time.time(), 0
             cancel_button = [[Button.inline("❌ Cancel Operation", data=f"livecancel_{job_id}")]]
             
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
             async with aiohttp.ClientSession() as session:
-                async with session.get(url) as r:
+                async with session.get(url, headers=headers) as r:
                     r.raise_for_status()
                     with open(local_file_path, 'wb') as f:
                         async for chunk in r.content.iter_chunked(1024 * 1024):
@@ -144,13 +159,18 @@ async def callback_handler(event):
                             downloaded_size += len(chunk)
                             current_time = time.time()
                             if current_time - last_update_time > 5:
-                                percentage = downloaded_size / total_size * 100
-                                speed = (downloaded_size - last_downloaded_size) / (current_time - last_update_time)
+                                percentage = downloaded_size / total_size * 100 if total_size > 0 else 0
+                                time_diff = current_time - last_update_time
+                                speed = (downloaded_size - last_downloaded_size) / time_diff if time_diff > 0 else 0
+                                # --- NEW: Calculate ETA ---
+                                eta = (total_size - downloaded_size) / speed if speed > 0 else None
+                                
                                 try:
                                     await event.edit(
                                         f"**Downloading...**\n"
                                         f"Progress: `{format_bytes(downloaded_size)}` of `{format_bytes(total_size)}` ({percentage:.1f}%)\n"
-                                        f"Speed: `{format_speed(speed)}`",
+                                        f"Speed: `{format_speed(speed)}`\n"
+                                        f"ETA: `{format_time(eta)}`", # Display ETA
                                         buttons=cancel_button)
                                 except (MessageNotModifiedError, FloodWaitError): pass
                                 last_update_time, last_downloaded_size = current_time, downloaded_size
@@ -165,12 +185,17 @@ async def callback_handler(event):
                     current_time = time.time()
                     if current_time - last_upload_update > 5:
                         percentage = current / total * 100
-                        speed = (current - last_uploaded_size) / (current_time - last_upload_update)
+                        time_diff = current_time - last_upload_update
+                        speed = (current - last_uploaded_size) / time_diff if time_diff > 0 else 0
+                        # --- NEW: Calculate ETA ---
+                        eta = (total - current) / speed if speed > 0 else None
+                        
                         try:
                             await event.edit(
                                 f"**Uploading...**\n"
                                 f"Progress: `{format_bytes(current)}` of `{format_bytes(total)}` ({percentage:.1f}%)\n"
-                                f"Speed: `{format_speed(speed)}`",
+                                f"Speed: `{format_speed(speed)}`\n"
+                                f"ETA: `{format_time(eta)}`", # Display ETA
                                 buttons=cancel_button)
                         except (MessageNotModifiedError, FloodWaitError): pass
                         last_upload_update, last_uploaded_size = current_time, current
@@ -190,45 +215,35 @@ async def callback_handler(event):
             logging.error(f"Error on job {job_id}: {e}")
             await event.edit(f"❌ **An unexpected error occurred:**\n`{str(e)}`")
         finally:
-            # --- **FIX**: Clean up job and file in the finally block ---
-            DOWNLOAD_JOBS.pop(job_id, None) 
+            DOWNLOAD_JOBS.pop(job_id, None)
             if local_file_path and os.path.exists(local_file_path):
                 os.remove(local_file_path)
                 logging.info(f"Cleaned up for job {job_id}")
 
-# --- Graceful Shutdown and Main Execution ---
+# --- Graceful Shutdown and Main Execution (Unchanged) ---
 async def shutdown(loop):
-    """Graceful shutdown handler."""
     logging.warning("Shutdown signal received. Cleaning up...")
-    # Clean up all files in the downloads directory
     for filename in os.listdir(DOWNLOADS_DIR):
         file_path = os.path.join(DOWNLOADS_DIR, filename)
-        try:
-            os.remove(file_path)
-            logging.info(f"Deleted orphan file: {filename}")
-        except Exception as e:
-            logging.error(f"Failed to delete {file_path}: {e}")
+        try: os.remove(file_path)
+        except Exception: pass
     
-    # Disconnect the bot
     if bot.is_connected():
         await bot.disconnect()
         logging.info("Bot disconnected.")
     
-    # Find and cancel all pending tasks
     tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
     [task.cancel() for task in tasks]
     await asyncio.gather(*tasks, return_exceptions=True)
     loop.stop()
 
 async def main():
-    """Main function to start the bot and register signal handlers."""
     await bot.start(bot_token=BOT_TOKEN)
-    logging.info("Bot is running...")
+    logging.info("Bot is running in ROBUST (Download-Upload) mode...")
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
     loop = asyncio.get_event_loop()
-    # --- **FIX**: Use asyncio's built-in signal handling ---
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown(loop)))
     
