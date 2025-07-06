@@ -3,13 +3,13 @@ import re
 import logging
 import asyncio
 import aiohttp
-import uuid  # Import the uuid library
-from urllib.parse import unquote, urlparse
+import uuid
 import time
+import signal # For graceful shutdown
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
-from telethon.errors.rpcerrorlist import FloodWaitError
+from telethon.errors.rpcerrorlist import FloodWaitError, MessageNotModifiedError
 from telethon.tl.types import DocumentAttributeFilename
 
 # --- Basic Configuration ---
@@ -23,15 +23,30 @@ API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 
 # --- Initialize the Bot Client ---
-bot = TelegramClient('DlinkX_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+bot = TelegramClient('DlinkX_bot', API_ID, API_HASH)
 
 # --- Constants & State Management ---
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-DOWNLOAD_JOBS = {}  # In-memory storage for active download jobs
+# The job dictionary now holds a cancellation event for each job
+DOWNLOAD_JOBS = {} 
 
-# --- Helper Functions (No changes here) ---
+# --- Helper Functions ---
+def format_bytes(size: int) -> str:
+    if size == 0: return "0 B"
+    power = 1024; n = 0
+    power_labels = {0: '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
+    while size >= power and n < len(power_labels) - 1:
+        size /= power; n += 1
+    return f"{size:.2f} {power_labels[n]}B"
+
+def format_speed(speed_bytes_per_sec: float) -> str:
+    """Formats speed into a human-readable string (KB/s, MB/s)."""
+    if speed_bytes_per_sec == 0: return "0 B/s"
+    return f"{format_bytes(int(speed_bytes_per_sec))}/s"
+
 async def get_link_info(url: str) -> dict:
+    # (This function remains unchanged)
     try:
         async with aiohttp.ClientSession() as session:
             async with session.head(url, allow_redirects=True, timeout=10) as r:
@@ -54,16 +69,6 @@ async def get_link_info(url: str) -> dict:
         logging.error(f"AIOHTTP failed to fetch info for {url}: {e}")
         return {"success": False, "error": str(e)}
 
-def format_bytes(size: int) -> str:
-    if size == 0: return "0 B"
-    power = 1024
-    n = 0
-    power_labels = {0: '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
-    while size >= power and n < len(power_labels) - 1:
-        size /= power
-        n += 1
-    return f"{size:.2f} {power_labels[n]}B"
-
 # --- Event Handlers ---
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
@@ -71,53 +76,46 @@ async def start_handler(event):
 
 @bot.on(events.NewMessage(pattern=re.compile(r'https?://\S+')))
 async def link_handler(event):
-    """
-    Handles links, stores job info, and sends buttons with a unique job ID.
-    """
     url = event.text.strip()
     status_message = await event.reply("🔎 `Fetching link details...`")
-
     info = await get_link_info(url)
-
     if not info.get("success"):
-        await status_message.edit(f"❌ **Error:** Could not fetch details for the link.\n`{info.get('error')}`")
+        await status_message.edit(f"❌ **Error:**\n`{info.get('error')}`")
         return
 
-    # --- Create a unique job ID and store job details ---
-    job_id = uuid.uuid4().hex[:16]  # A short, unique ID
-    DOWNLOAD_JOBS[job_id] = info
-    logging.info(f"Created job {job_id} for URL: {info['url']}")
+    job_id = uuid.uuid4().hex[:16]
+    # Store the job info along with a cancellation event
+    DOWNLOAD_JOBS[job_id] = {"info": info, "cancellation_event": asyncio.Event()}
+    logging.info(f"Created job {job_id}")
 
-    # --- Create inline buttons with the short job ID ---
-    buttons = [
-        [Button.inline("✅ Proceed", data=f"dl_{job_id}"),
-         Button.inline("❌ Cancel", data=f"cancel_{job_id}")]
-    ]
-    
+    buttons = [[Button.inline("✅ Proceed", data=f"dl_{job_id}"), Button.inline("❌ Cancel", data=f"cancel_{job_id}")]]
     response_text = (
         f"**File Details:**\n\n"
         f"**File Name:** `{info['file_name']}`\n"
-        f"**Size:** `{format_bytes(info['content_size'])}`\n\n"
-        f"Do you want to proceed?"
+        f"**Size:** `{format_bytes(info['content_size'])}`"
     )
-    
     await status_message.edit(response_text, buttons=buttons)
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
-    """Handles button clicks with optimized progress updates."""
     data_parts = event.data.decode('utf-8').split('_', 1)
     action = data_parts[0]
     job_id = data_parts[1]
     
-    chat_id = event.chat_id
-    local_file_path = None
+    # --- Live Cancel Handling ---
+    if action == "livecancel":
+        job = DOWNLOAD_JOBS.get(job_id)
+        if job:
+            job["cancellation_event"].set()
+            logging.info(f"Cancellation requested for job {job_id}.")
+            await event.answer("Cancellation signal sent...")
+        else:
+            await event.answer("This job is already completed or invalid.", alert=True)
+        return
 
-    job_info = DOWNLOAD_JOBS.pop(job_id, None)
-
-    if not job_info:
-        await event.answer("This download job has expired or is invalid.", alert=True)
-        await event.edit("This action has expired.")
+    job_data = DOWNLOAD_JOBS.pop(job_id, None)
+    if not job_data:
+        await event.answer("This job has expired or is invalid.", alert=True)
         return
 
     if action == "cancel":
@@ -126,71 +124,77 @@ async def callback_handler(event):
         return
 
     if action == "dl":
+        local_file_path = None
+        info = job_data["info"]
+        cancellation_event = job_data["cancellation_event"]
         try:
             await event.answer("Request accepted! Starting process...")
+            url, file_name, total_size = info['url'], info['file_name'], info['content_size']
+            local_file_path = os.path.join(DOWNLOADS_DIR, f"{event.chat_id}_{job_id}_{file_name}")
+
+            # --- Optimized Async Download with Live Cancel ---
+            downloaded_size, last_update_time, last_downloaded_size = 0, time.time(), 0
+            cancel_button = [[Button.inline("❌ Cancel Download", data=f"livecancel_{job_id}")]]
             
-            url = job_info['url']
-            file_name = job_info['file_name']
-            total_size = job_info['content_size']
-            local_file_path = os.path.join(DOWNLOADS_DIR, f"{chat_id}_{job_id}_{file_name}")
-
-            # --- Optimized Async Download ---
-            downloaded_size = 0
-            last_update_time = time.time()
-
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as r:
                     r.raise_for_status()
                     with open(local_file_path, 'wb') as f:
-                        async for chunk in r.content.iter_chunked(1024 * 1024): # 1MB chunks
+                        async for chunk in r.content.iter_chunked(1024 * 1024):
+                            if cancellation_event.is_set():
+                                raise asyncio.CancelledError
                             f.write(chunk)
                             downloaded_size += len(chunk)
-                            
-                            # --- THROTTLING LOGIC ---
-                            # Only edit the message every 5 seconds to avoid flood waits and improve speed
                             current_time = time.time()
-                            if current_time - last_update_time > 5:
+                            if current_time - last_update_time > 5: # 5 second delay
                                 percentage = downloaded_size / total_size * 100
+                                speed = (downloaded_size - last_downloaded_size) / (current_time - last_update_time)
                                 try:
                                     await event.edit(
-                                        f"**Downloading to server...**\n"
-                                        f"File: `{file_name}`\n"
-                                        f"Progress: `{format_bytes(downloaded_size)}` of `{format_bytes(total_size)}` ({percentage:.1f}%)"
+                                        f"**Downloading...**\n"
+                                        f"Progress: `{format_bytes(downloaded_size)}` of `{format_bytes(total_size)}` ({percentage:.1f}%)\n"
+                                        f"Speed: `{format_speed(speed)}`",
+                                        buttons=cancel_button
                                     )
-                                    last_update_time = current_time
-                                except FloodWaitError as e:
-                                    await asyncio.sleep(e.seconds)
+                                except (MessageNotModifiedError, FloodWaitError): pass
+                                last_update_time, last_downloaded_size = current_time, downloaded_size
 
-            await event.edit(f"`Upload starting for {file_name}...`")
-
-            # --- Optimized Async Upload ---
-            # We create a closure to keep track of the last update time for the upload progress
+            # --- Optimized Async Upload with Live Cancel ---
+            await event.edit("`Upload starting...`", buttons=cancel_button)
+            
+            # We create a closure to manage state for the upload callback
             def create_upload_callback():
-                last_upload_update = time.time()
-                
+                last_upload_update, last_uploaded_size = time.time(), 0
                 async def upload_progress_callback(current, total):
-                    nonlocal last_upload_update
+                    nonlocal last_upload_update, last_uploaded_size
+                    if cancellation_event.is_set():
+                        raise asyncio.CancelledError
                     current_time = time.time()
                     if current_time - last_upload_update > 5:
                         percentage = current / total * 100
+                        speed = (current - last_uploaded_size) / (current_time - last_upload_update)
                         try:
-                            await event.edit(f"**Uploading to you...**\n`{format_bytes(current)}` of `{format_bytes(total)}` ({percentage:.1f}%)")
-                            last_upload_update = current_time
-                        except FloodWaitError as e:
-                            await asyncio.sleep(e.seconds)
-                
+                            await event.edit(
+                                f"**Uploading...**\n"
+                                f"Progress: `{format_bytes(current)}` of `{format_bytes(total)}` ({percentage:.1f}%)\n"
+                                f"Speed: `{format_speed(speed)}`",
+                                buttons=cancel_button
+                            )
+                        except (MessageNotModifiedError, FloodWaitError): pass
+                        last_upload_update, last_uploaded_size = current_time, current
                 return upload_progress_callback
 
             attributes = [DocumentAttributeFilename(file_name=file_name)]
             await bot.send_file(
-                chat_id, local_file_path,
-                caption=f"`{file_name}`\n\nDownloaded via **DlinkX**.",
-                progress_callback=create_upload_callback(), 
-                attributes=attributes
+                event.chat_id, local_file_path,
+                caption=f"`{file_name}`", progress_callback=create_upload_callback(),
+                attributes=attributes, cancellable=cancellation_event
             )
-            
             await event.delete()
 
+        except asyncio.CancelledError:
+            await event.edit("🚫 **Operation Canceled.**")
+            logging.info(f"Job {job_id} was cancelled successfully.")
         except Exception as e:
             logging.error(f"Error on job {job_id}: {e}")
             await event.edit(f"❌ **An unexpected error occurred:**\n`{str(e)}`")
@@ -199,10 +203,34 @@ async def callback_handler(event):
                 os.remove(local_file_path)
                 logging.info(f"Cleaned up temporary file for job {job_id}")
 
-# --- Main Execution ---
+# --- Graceful Shutdown and Main Execution ---
 async def main():
-    logging.info("Bot is starting...")
+    """Main function to start the bot and handle shutdown."""
+    # Define the shutdown handler
+    def shutdown_handler(sig, frame):
+        logging.warning("Shutdown signal received. Cleaning up and exiting.")
+        # Clean up all files in the downloads directory
+        for filename in os.listdir(DOWNLOADS_DIR):
+            file_path = os.path.join(DOWNLOADS_DIR, filename)
+            try:
+                os.remove(file_path)
+                logging.info(f"Deleted orphan file: {filename}")
+            except Exception as e:
+                logging.error(f"Failed to delete {file_path}: {e}")
+        
+        # Stop the asyncio event loop
+        bot.loop.stop()
+
+    # Register the signal handler for Ctrl+C
+    signal.signal(signal.SIGINT, shutdown_handler)
+    
+    # Start the bot
+    await bot.start(bot_token=BOT_TOKEN)
+    logging.info("Bot is running...")
+    
+    # Run until the loop is stopped by the shutdown handler
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
+    # Run the main async function
     bot.loop.run_until_complete(main())
