@@ -40,7 +40,18 @@ except (ValueError, TypeError):
     MAX_FILE_SIZE_BYTES = 2000 * 1024 * 1024
 
 # --- Initialize the Bot Client ---
-bot = TelegramClient('DlinkX_bot', API_ID, API_HASH)
+bot = TelegramClient(
+    'DlinkX_bot',
+    API_ID,
+    API_HASH,
+    device_model=f"DlinkX Bot",
+    system_version="4.16.30-vxCUSTOM",
+    app_version="1.0",
+    lang_code="en",
+    upload_connections=16, # <-- The key to increasing speed
+    connection_retries=10,
+    auto_reconnect=True
+)
 
 # --- Constants & State Management ---
 DOWNLOADS_DIR = "downloads"
