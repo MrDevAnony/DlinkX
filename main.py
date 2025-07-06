@@ -5,8 +5,8 @@ import asyncio
 import aiohttp
 import uuid
 import time
-import signal # For graceful shutdown
-
+import signal
+from urllib.parse import unquote, urlparse
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
 from telethon.errors.rpcerrorlist import FloodWaitError, MessageNotModifiedError
