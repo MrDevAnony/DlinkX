@@ -50,7 +50,7 @@ BLACKLIST_FILE = "blacklist.txt"
 BLACKLISTED_USERS = set()
 USER_COOLDOWNS = {}
 COOLDOWN_SECONDS = 10
-MAX_CONCURRENT_DOWNLOADS = os.getenv('MAX_CONCURRENT_DOWNLOADS')
+MAX_CONCURRENT_DOWNLOADS = int(os.getenv('MAX_CONCURRENT_DOWNLOADS'))
 download_queue = asyncio.Queue()
 
 # --- Helper Functions (Unchanged) ---
