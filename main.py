@@ -105,7 +105,7 @@ async def link_handler(event):
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
-    """Handles button clicks using the job_id to retrieve download info."""
+    """Handles button clicks with optimized progress updates."""
     data_parts = event.data.decode('utf-8').split('_', 1)
     action = data_parts[0]
     job_id = data_parts[1]
@@ -113,7 +113,6 @@ async def callback_handler(event):
     chat_id = event.chat_id
     local_file_path = None
 
-    # --- Retrieve the job and then remove it to prevent re-use ---
     job_info = DOWNLOAD_JOBS.pop(job_id, None)
 
     if not job_info:
@@ -135,8 +134,10 @@ async def callback_handler(event):
             total_size = job_info['content_size']
             local_file_path = os.path.join(DOWNLOADS_DIR, f"{chat_id}_{job_id}_{file_name}")
 
-            # --- Async Download ---
+            # --- Optimized Async Download ---
             downloaded_size = 0
+            last_update_time = time.time()
+
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as r:
                     r.raise_for_status()
@@ -144,33 +145,48 @@ async def callback_handler(event):
                         async for chunk in r.content.iter_chunked(1024 * 1024): # 1MB chunks
                             f.write(chunk)
                             downloaded_size += len(chunk)
-                            percentage = downloaded_size / total_size * 100
-                            try:
-                                time.sleep(1)  # Throttle updates
-                                await event.edit(
-                                    f"**Downloading to server...**\n"
-                                    f"File: `{file_name}`\n"
-                                    f"Progress: `{format_bytes(downloaded_size)}` of `{format_bytes(total_size)}` ({percentage:.1f}%)"
-                                )
-                            except FloodWaitError as e:
-                                await asyncio.sleep(e.seconds)
+                            
+                            # --- THROTTLING LOGIC ---
+                            # Only edit the message every 3 seconds to avoid flood waits and improve speed
+                            current_time = time.time()
+                            if current_time - last_update_time > 3:
+                                percentage = downloaded_size / total_size * 100
+                                try:
+                                    await event.edit(
+                                        f"**Downloading to server...**\n"
+                                        f"File: `{file_name}`\n"
+                                        f"Progress: `{format_bytes(downloaded_size)}` of `{format_bytes(total_size)}` ({percentage:.1f}%)"
+                                    )
+                                    last_update_time = current_time
+                                except FloodWaitError as e:
+                                    await asyncio.sleep(e.seconds)
 
             await event.edit(f"`Upload starting for {file_name}...`")
 
-            # --- Async Upload ---
-            async def upload_progress_callback(current, total):
-                percentage = current / total * 100
-                try:
-                    time.sleep(1)  # Throttle updates
-                    await event.edit(f"**Uploading to you...**\n`{format_bytes(current)}` of `{format_bytes(total)}` ({percentage:.1f}%)")
-                except FloodWaitError as e:
-                    await asyncio.sleep(e.seconds)
-            
+            # --- Optimized Async Upload ---
+            # We create a closure to keep track of the last update time for the upload progress
+            def create_upload_callback():
+                last_upload_update = time.time()
+                
+                async def upload_progress_callback(current, total):
+                    nonlocal last_upload_update
+                    current_time = time.time()
+                    if current_time - last_upload_update > 3:
+                        percentage = current / total * 100
+                        try:
+                            await event.edit(f"**Uploading to you...**\n`{format_bytes(current)}` of `{format_bytes(total)}` ({percentage:.1f}%)")
+                            last_upload_update = current_time
+                        except FloodWaitError as e:
+                            await asyncio.sleep(e.seconds)
+                
+                return upload_progress_callback
+
             attributes = [DocumentAttributeFilename(file_name=file_name)]
             await bot.send_file(
                 chat_id, local_file_path,
-                caption=f"`{file_name}`\n\nDownloaded via **@DlinxBot**.",
-                progress_callback=upload_progress_callback, attributes=attributes
+                caption=f"`{file_name}`\n\nDownloaded via **DlinkX**.",
+                progress_callback=create_upload_callback(), 
+                attributes=attributes
             )
             
             await event.delete()
