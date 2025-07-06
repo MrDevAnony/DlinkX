@@ -4,6 +4,7 @@ import logging
 import asyncio
 import requests
 from urllib.parse import unquote, urlparse
+import time
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -148,6 +149,7 @@ async def link_handler(event):
                         f.write(chunk)
                         downloaded_size += len(chunk)
                         percentage = downloaded_size / total_size * 100
+                        time.sleep(1)  # Simulate a delay for the progress update.
                         await status_message.edit(
                             f"**Downloading to server...**\n"
                             f"`{format_bytes(downloaded_size)}` of `{format_bytes(total_size)}` ({percentage:.1f}%)"
