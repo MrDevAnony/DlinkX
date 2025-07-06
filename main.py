@@ -147,9 +147,9 @@ async def callback_handler(event):
                             downloaded_size += len(chunk)
                             
                             # --- THROTTLING LOGIC ---
-                            # Only edit the message every 3 seconds to avoid flood waits and improve speed
+                            # Only edit the message every 5 seconds to avoid flood waits and improve speed
                             current_time = time.time()
-                            if current_time - last_update_time > 3:
+                            if current_time - last_update_time > 5:
                                 percentage = downloaded_size / total_size * 100
                                 try:
                                     await event.edit(
@@ -171,7 +171,7 @@ async def callback_handler(event):
                 async def upload_progress_callback(current, total):
                     nonlocal last_upload_update
                     current_time = time.time()
-                    if current_time - last_upload_update > 3:
+                    if current_time - last_upload_update > 5:
                         percentage = current / total * 100
                         try:
                             await event.edit(f"**Uploading to you...**\n`{format_bytes(current)}` of `{format_bytes(total)}` ({percentage:.1f}%)")
