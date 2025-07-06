@@ -3,6 +3,7 @@ import re
 import logging
 import asyncio
 import aiohttp
+import uuid  # Import the uuid library
 from urllib.parse import unquote, urlparse
 
 from dotenv import load_dotenv
@@ -23,21 +24,17 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 # --- Initialize the Bot Client ---
 bot = TelegramClient('DlinkX_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# --- Constants ---
+# --- Constants & State Management ---
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+DOWNLOAD_JOBS = {}  # In-memory storage for active download jobs
 
-
-# --- Helper Functions ---
+# --- Helper Functions (No changes here) ---
 async def get_link_info(url: str) -> dict:
-    """
-    Asynchronously fetches information about a URL using aiohttp.
-    """
     try:
         async with aiohttp.ClientSession() as session:
             async with session.head(url, allow_redirects=True, timeout=10) as r:
                 r.raise_for_status()
-
                 file_name = "Unknown"
                 if 'Content-Disposition' in r.headers:
                     cd = r.headers.get('Content-Disposition')
@@ -47,14 +44,9 @@ async def get_link_info(url: str) -> dict:
                 else:
                     path = urlparse(str(r.url)).path
                     file_name = unquote(os.path.basename(path)) if path else "download"
-                
-                # Sanitize file_name for safety
                 file_name = re.sub(r'[\\/*?:"<>|]', "", file_name)
-
                 return {
-                    "success": True,
-                    "url": str(r.url),
-                    "file_name": file_name,
+                    "success": True, "url": str(r.url), "file_name": file_name,
                     "content_size": int(r.headers.get('Content-Length', 0)),
                 }
     except Exception as e:
@@ -62,9 +54,7 @@ async def get_link_info(url: str) -> dict:
         return {"success": False, "error": str(e)}
 
 def format_bytes(size: int) -> str:
-    """Formats a size in bytes into a human-readable string."""
-    if size == 0:
-        return "0 B"
+    if size == 0: return "0 B"
     power = 1024
     n = 0
     power_labels = {0: '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
@@ -73,23 +63,15 @@ def format_bytes(size: int) -> str:
         n += 1
     return f"{size:.2f} {power_labels[n]}B"
 
-
 # --- Event Handlers ---
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
-    """Handler for the /start command."""
-    sender = await event.get_sender()
-    logging.info(f"User {sender.id} started the bot.")
-    await event.reply(
-        f"Hello, {sender.first_name}! 👋\n\n"
-        "I am DlinkX, your advanced link downloader.\n"
-        "Send me any direct download link and I will handle it for you."
-    )
+    await event.reply("Hello! I am DlinkX. Send me a direct download link.")
 
 @bot.on(events.NewMessage(pattern=re.compile(r'https?://\S+')))
 async def link_handler(event):
     """
-    Handles incoming messages with links. It now presents inline buttons for confirmation.
+    Handles links, stores job info, and sends buttons with a unique job ID.
     """
     url = event.text.strip()
     status_message = await event.reply("🔎 `Fetching link details...`")
@@ -100,10 +82,15 @@ async def link_handler(event):
         await status_message.edit(f"❌ **Error:** Could not fetch details for the link.\n`{info.get('error')}`")
         return
 
-    # Create inline buttons
+    # --- Create a unique job ID and store job details ---
+    job_id = uuid.uuid4().hex[:16]  # A short, unique ID
+    DOWNLOAD_JOBS[job_id] = info
+    logging.info(f"Created job {job_id} for URL: {info['url']}")
+
+    # --- Create inline buttons with the short job ID ---
     buttons = [
-        [Button.inline("✅ Proceed", data=f"dl_{info['url']}"),
-         Button.inline("❌ Cancel", data="cancel")]
+        [Button.inline("✅ Proceed", data=f"dl_{job_id}"),
+         Button.inline("❌ Cancel", data=f"cancel_{job_id}")]
     ]
     
     response_text = (
@@ -117,33 +104,35 @@ async def link_handler(event):
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
-    """Handles button clicks from inline keyboards."""
-    data = event.data.decode('utf-8')
-    chat_id = event.chat_id
-    message_id = event.message_id
+    """Handles button clicks using the job_id to retrieve download info."""
+    data_parts = event.data.decode('utf-8').split('_', 1)
+    action = data_parts[0]
+    job_id = data_parts[1]
     
+    chat_id = event.chat_id
     local_file_path = None
 
-    try:
-        if data == "cancel":
-            await event.edit("**Download canceled by user.** 🤷‍♂️")
-            return
+    # --- Retrieve the job and then remove it to prevent re-use ---
+    job_info = DOWNLOAD_JOBS.pop(job_id, None)
 
-        if data.startswith("dl_"):
-            url = data[3:]
-            
-            # Acknowledge the button click immediately
+    if not job_info:
+        await event.answer("This download job has expired or is invalid.", alert=True)
+        await event.edit("This action has expired.")
+        return
+
+    if action == "cancel":
+        await event.edit("**Download canceled by user.** 🤷‍♂️")
+        logging.info(f"Canceled job {job_id}.")
+        return
+
+    if action == "dl":
+        try:
             await event.answer("Request accepted! Starting process...")
             
-            # --- Download and Upload Logic ---
-            info = await get_link_info(url)
-            if not info.get("success"):
-                await event.edit(f"❌ **Error:** Could not re-verify the link.\n`{info.get('error')}`")
-                return
-
-            file_name = info['file_name']
-            total_size = info['content_size']
-            local_file_path = os.path.join(DOWNLOADS_DIR, f"{chat_id}_{message_id}_{file_name}")
+            url = job_info['url']
+            file_name = job_info['file_name']
+            total_size = job_info['content_size']
+            local_file_path = os.path.join(DOWNLOADS_DIR, f"{chat_id}_{job_id}_{file_name}")
 
             # --- Async Download ---
             downloaded_size = 0
@@ -158,51 +147,41 @@ async def callback_handler(event):
                             try:
                                 await event.edit(
                                     f"**Downloading to server...**\n"
-                                    f"`{format_bytes(downloaded_size)}` of `{format_bytes(total_size)}` ({percentage:.1f}%)"
+                                    f"File: `{file_name}`\n"
+                                    f"Progress: `{format_bytes(downloaded_size)}` of `{format_bytes(total_size)}` ({percentage:.1f}%)"
                                 )
                             except FloodWaitError as e:
-                                logging.warning(f"Flood wait of {e.seconds}s. Pausing updates.")
                                 await asyncio.sleep(e.seconds)
 
-            await event.edit("`Download complete. Starting upload to Telegram...`")
+            await event.edit(f"`Upload starting for {file_name}...`")
 
             # --- Async Upload ---
             async def upload_progress_callback(current, total):
                 percentage = current / total * 100
                 try:
-                    await event.edit(
-                        f"**Uploading to you...**\n"
-                        f"`{format_bytes(current)}` of `{format_bytes(total)}` ({percentage:.1f}%)"
-                    )
+                    await event.edit(f"**Uploading to you...**\n`{format_bytes(current)}` of `{format_bytes(total)}` ({percentage:.1f}%)")
                 except FloodWaitError as e:
-                    logging.warning(f"Flood wait of {e.seconds}s. Pausing updates.")
                     await asyncio.sleep(e.seconds)
             
-            # Using DocumentAttributeFilename to ensure correct filename on Telegram
             attributes = [DocumentAttributeFilename(file_name=file_name)]
             await bot.send_file(
-                chat_id,
-                local_file_path,
+                chat_id, local_file_path,
                 caption=f"`{file_name}`\n\nDownloaded via **DlinkX**.",
-                progress_callback=upload_progress_callback,
-                attributes=attributes
+                progress_callback=upload_progress_callback, attributes=attributes
             )
             
-            await event.delete() # Clean up the status message
+            await event.delete()
 
-    except Exception as e:
-        logging.error(f"An error occurred in callback_handler: {e}")
-        await event.edit(f"❌ **An unexpected error occurred:**\n`{str(e)}`")
-    finally:
-        # --- Cleanup ---
-        if local_file_path and os.path.exists(local_file_path):
-            os.remove(local_file_path)
-            logging.info(f"Cleaned up temporary file: {local_file_path}")
-
+        except Exception as e:
+            logging.error(f"Error on job {job_id}: {e}")
+            await event.edit(f"❌ **An unexpected error occurred:**\n`{str(e)}`")
+        finally:
+            if local_file_path and os.path.exists(local_file_path):
+                os.remove(local_file_path)
+                logging.info(f"Cleaned up temporary file for job {job_id}")
 
 # --- Main Execution ---
 async def main():
-    """Main function to run the bot."""
     logging.info("Bot is starting...")
     await bot.run_until_disconnected()
 
