@@ -145,6 +145,7 @@ async def callback_handler(event):
                             downloaded_size += len(chunk)
                             percentage = downloaded_size / total_size * 100
                             try:
+                                time.sleep(1)  # Throttle updates
                                 await event.edit(
                                     f"**Downloading to server...**\n"
                                     f"File: `{file_name}`\n"
@@ -159,6 +160,7 @@ async def callback_handler(event):
             async def upload_progress_callback(current, total):
                 percentage = current / total * 100
                 try:
+                    time.sleep(1)  # Throttle updates
                     await event.edit(f"**Uploading to you...**\n`{format_bytes(current)}` of `{format_bytes(total)}` ({percentage:.1f}%)")
                 except FloodWaitError as e:
                     await asyncio.sleep(e.seconds)
@@ -166,7 +168,7 @@ async def callback_handler(event):
             attributes = [DocumentAttributeFilename(file_name=file_name)]
             await bot.send_file(
                 chat_id, local_file_path,
-                caption=f"`{file_name}`\n\nDownloaded via **DlinkX**.",
+                caption=f"`{file_name}`\n\nDownloaded via **@DlinxBot**.",
                 progress_callback=upload_progress_callback, attributes=attributes
             )
             
